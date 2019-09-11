@@ -10,12 +10,12 @@
 class i18n {
 
     /**
-     * Language file path
-     * This is the path for the language files. You must use the '{LANGUAGE}' placeholder for the language or the script wont find any language files.
+     * Language file paths
+     * This is the paths for the language files. You must use the '{LANGUAGE}' placeholder for the language or the script wont find any language files.
      *
-     * @var string
+     * @var array
      */
-    protected $filePath = './lang/lang_{LANGUAGE}.ini';
+    protected $filePaths = array('./lang/lang_{LANGUAGE}.ini');
 
     /**
      * Cache file path
@@ -93,6 +93,7 @@ class i18n {
     protected $userLangs = array();
 
     protected $appliedLang = NULL;
+    protected $activeConfigs = NULL;
     protected $isInitialized = false;
 
 
@@ -100,15 +101,15 @@ class i18n {
      * Constructor
      * The constructor sets all important settings. All params are optional, you can set the options via extra functions too.
      *
-     * @param string [$filePath] This is the path for the language files. You must use the '{LANGUAGE}' placeholder for the language.
+     * @param mixed [$filePaths] This is the path (deprecated) or array of paths (preferred) for the language files. You must use the '{LANGUAGE}' placeholder for the language.
      * @param string [$cachePath] This is the path for all the cache files. Best is an empty directory with no other files in it. No placeholders.
      * @param string [$fallbackLang] This is the language which is used when there is no language file for all other user languages. It has the lowest priority.
      * @param string [$prefix] The class name of the compiled class that contains the translated texts. Defaults to 'L'.
      */
-    public function __construct($filePath = NULL, $cachePath = NULL, $fallbackLang = NULL, $prefix = NULL) {
+    public function __construct($filePaths = NULL, $cachePath = NULL, $fallbackLang = NULL, $prefix = NULL) {
         // Apply settings
-        if ($filePath != NULL) {
-            $this->filePath = $filePath;
+        if ($filePaths != NULL) {
+            $this->filePaths = is_array($filePaths) ? $filePaths : array($filePaths);
         }
 
         if ($cachePath != NULL) {
@@ -132,51 +133,47 @@ class i18n {
         $this->isInitialized = true;
 
         $this->userLangs = $this->getUserLangs();
+        $this->appliedLang = $this->calcAppliedLang();
 
-        $langFilePath = NULL;
+        $this->staticMap = $this->initStaticMap();
+        $this->activeConfigs = $this->getActiveConfigs();
 
-        // search for language file
-        $this->appliedLang = NULL;
-        foreach ($this->userLangs as $priority => $langcode) {
-            $langFilePath = $this->getConfigFilename($langcode);
-            if (file_exists($langFilePath)) {
-                $this->appliedLang = $langcode;
-                break;
-            }
-        }
-        if ($this->appliedLang == NULL) {
-            throw new RuntimeException('No language file was found.');
-        }
-
-        // initialize and hash staticMap
-        $smap_hash = NULL;
+        $state_hctx = hash_init('md5');
         if ($this->staticMap) {
-            $smap_hctx = hash_init('md5');
-            $new_staticMap = array();
-            ksort($this->staticMap);
-            foreach ($this->staticMap as $placeholder => $repl) {
-                hash_update($smap_hctx, $placeholder . $repl);
-                $new_staticMap['{' . $placeholder . '}'] = $repl;
+            $sorted = $this->staticMap;
+            ksort($sorted);
+            foreach ($sorted as $placeholder => $repl) {
+                hash_update($state_hctx, $placeholder . $repl);
             }
-            $smap_hash = hash_final($smap_hctx);
-            $this->staticMap = $new_staticMap;
-            unset($new_staticMap, $smap_hctx);
+            unset($sorted);
         }
-
-        $cacheFilePath = NULL;
+        foreach ($this->activeConfigs as $langPath) {
+            hash_update($state_hctx, $langPath);
+        }
+        $state_hash = hash_final($state_hctx);
+        unset($state_hctx);
 
         // search for cache file
-        $cacheFilePath = $this->cachePath . '/php_i18n_' . md5_file(__FILE__) . '_' . ($smap_hash ? $smap_hash . '_' : '') . $this->prefix . '_' . $this->appliedLang . '.cache.php';
+        $cacheFilePath = $this->cachePath . '/php_i18n_' . md5_file(__FILE__) . '_' . $state_hash . '_' . $this->prefix . '_' . $this->appliedLang . '.cache.php';
 
-        // whether we need to create a new cache file
-        $outdated = !file_exists($cacheFilePath) ||
-            filemtime($cacheFilePath) < filemtime($langFilePath) || // the language config was updated
-            ($this->mergeFallback && filemtime($cacheFilePath) < filemtime($this->getConfigFilename($this->fallbackLang))); // the fallback language config was updated
+        // check whether we need to create a new cache file
+        $outdated = false;
+        if (!file_exists($cacheFilePath))
+            $outdated = true;
+        else {
+            foreach ($this->activeConfigs as $langPath) {
+                // check if the language config was updated since the cache file was created
+                if (filemtime($cacheFilePath) < filemtime($langPath)) {
+                    $outdated = true;
+                    break;
+                }
+            }
+        }
 
         if ($outdated) {
-            $config = $this->load($langFilePath);
-            if ($this->mergeFallback)
-                $config = array_replace_recursive($this->load($this->getConfigFilename($this->fallbackLang)), $config);
+            $config = array();
+            foreach ($this->activeConfigs as $langPath)
+                $config = array_replace_recursive($this->load($langPath), $config);
 
             $compiled = "<?php class " . $this->prefix . " {\n"
             	. $this->compile($config)
@@ -217,9 +214,9 @@ class i18n {
         return $this->fallbackLang;
     }
 
-    public function setFilePath($filePath) {
+    public function setFilePaths($filePaths) {
         $this->fail_after_init();
-        $this->filePath = $filePath;
+        $this->filePaths = $filePaths;
     }
 
     public function setCachePath($cachePath) {
@@ -255,6 +252,13 @@ class i18n {
     public function setStaticMap($map) {
         $this->fail_after_init();
         $this->staticMap = $map;
+    }
+
+    /**
+     * @deprecated Use setFilePaths.
+     */
+    public function setFilePath($filePath) {
+        $this->setFilePaths(array($filePath));
     }
 
     /**
@@ -315,8 +319,55 @@ class i18n {
         return $userLangs;
     }
 
-    protected function getConfigFilename($langcode) {
-        return str_replace('{LANGUAGE}', $langcode, $this->filePath);
+    protected function calcAppliedLang() {
+        // search for language files
+        // check order: $paths[0][LC] > $paths[1][LC] > ...$paths[N][LC]
+        $this->appliedLang = NULL;
+        foreach ($this->userLangs as $langcode) {
+            foreach ($this->getConfigFilenames($langcode) as $langPath) {
+                if (file_exists($langPath)) {
+                    return $langcode;
+                }
+            }
+        }
+        throw new RuntimeException('No language file was found.');
+    }
+
+    protected function getConfigFilenames($langcode, $fallback = NULL) {
+        /* merge order:
+         *   no fallback: $paths[0][LC] > $paths[1][LC] > ...$paths[N][LC]
+         *   fallback: $paths[0][LC] > $paths[0][FB] > $paths[1][LC] > $paths[1][FB] > ...$paths[N][LC] > $paths[N][FB]
+         */
+        $lc_files = str_replace('{LANGUAGE}', $langcode, $this->filePaths);
+        if ($fallback == NULL)
+            return $lc_files;
+        $fb_files = str_replace('{LANGUAGE}', $fallback, $this->filePaths);
+        $out_files = array();
+
+        // interleave arrays
+        for ($x = reset($lc_files), $y = reset($fb_files); $x && $y; $x = next($lc_files), $y = next($fb_files)) {
+            $out_files[] = $x;
+            $out_files[] = $y;
+        }
+        return $out_files;
+    }
+
+    protected function getActiveConfigs() {
+        if ($this->mergeFallback)
+            $fnames = $this->getConfigFilenames($this->appliedLang, $this->fallbackLang);
+        else
+            $fnames = $this->getConfigFilenames($this->appliedLang);
+        return array_filter($fnames, 'file_exists');
+    }
+
+    protected function initStaticMap() {
+        $newmap = array();
+        if ($this->staticMap) {
+            foreach ($this->staticMap as $placeholder => $repl) {
+                $newmap['{' . $placeholder . '}'] = $repl;
+            }
+        }
+        return $newmap;
     }
 
     protected function load($filename) {
